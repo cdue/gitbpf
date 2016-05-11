@@ -1,0 +1,520 @@
+#!/bin/sh -x
+#
+# git-bpf -- A collection of Git extensions to provide high-level
+# repository operations for Git Branch Per Feature (BPF) workflow.
+#
+# This project is an implementation of the Git BPF workflow
+# described by Adam Dymitruk:
+# 	http://dymitruk.com/blog/2012/02/05/branch-per-feature/
+# And its source code is wildly inspired by gitflow tools source code:
+#    https://github.com/nvie/gitflow
+# 
+# Feel free to contribute to this project at:
+#    https://github.com/cdue/gitbpf
+#
+# Copyright (c) 2015 Cédric Dué
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE
+#
+
+usage() {
+	echo "usage: git bpf init [-fd]"
+}
+
+parse_args() {
+	# parse options
+	FLAGS "$@" || exit $?
+	eval set -- "${FLAGS_ARGV}"
+}
+
+# Default entry when no SUBACTION is given
+cmd_default() {
+	DEFINE_boolean force false 'force setting of gitbpf branches, even if already configured' f
+	DEFINE_boolean defaults false 'use default branch naming conventions' d
+	parse_args "$@"
+	
+	if ! git rev-parse --git-dir >/dev/null 2>&1; then
+		git_do init
+	else
+		# assure that we are not working in a repo with local changes
+		git_repo_is_headless || require_clean_working_tree
+	fi
+
+	# running git bpf init on an already initialized repo is fine
+	if gitbpf_is_initialized && ! flag force; then
+		warn "Already initialized for gitbpf."
+		warn "To force reinitialization, use: git bpf init -f"
+		exit 0
+	fi
+
+	# TODO: if git bpf was already initialized for this repo (init -f used), then we need to do some cleanup
+	# remove aliases, etc.
+
+	local branch_count
+	local answer
+
+    if flag defaults; then
+        warn "Using default branch names."
+    fi
+
+	# add a master branch if no such branch exists yet
+	local master_branch
+	if gitbpf_has_master_configured && ! flag force; then
+		master_branch=$(git config --get gitbpf.branch.master)
+	else
+		# Two cases are distinguished:
+		# 1. A fresh git repo (without any branches)
+		#    We will create a new master/develop/QA branch for the user
+		# 2. Some branches do already exist
+		#    We will disallow creation of new master/develop/QA branches and
+		#    rather allow to use existing branches for git-bpf.
+		local default_suggestion
+		local should_check_existence
+		branch_count=$(git_local_branches | wc -l)
+		if [ "$branch_count" -eq 0 ]; then
+			echo "No branches exist yet. Base branches must be created now."
+			should_check_existence=NO
+			default_suggestion=$(git config --get gitbpf.branch.master || echo master)
+		else
+			echo
+			echo "Which branch should be used for bringing forth production releases?"
+			git_local_branches | sed 's/^.*$/   - &/g'
+
+			should_check_existence=YES
+			default_suggestion=
+			for guess in $(git config --get gitbpf.branch.master) \
+			             'production' 'main' 'master (default)'; do
+			    suggestion=$(echo $guess | sed 's/ .*//')
+				if git_local_branch_exists "$suggestion"; then
+					default_suggestion="$suggestion"
+					break
+				fi
+			done
+		fi
+		
+		printf "Branch name for production releases: [$default_suggestion] "
+		if noflag defaults; then
+			read answer
+		else
+			printf "\n"
+		fi
+		master_branch=${answer:-$default_suggestion}
+
+		# check existence in case of an already existing repo
+		if [ "$should_check_existence" = "YES" ]; then
+			# if no local branch exists and a remote branch of the same
+			# name exists, checkout that branch and use it production branch
+			if ! git_local_branch_exists "$master_branch" && \
+				git_remote_branch_exists "origin/$master_branch"; then
+				git_do branch "$master_branch" "origin/$master_branch" >/dev/null 2>&1
+			elif ! git_local_branch_exists "$master_branch"; then
+				die "Local branch '$master_branch' does not exist."
+			fi
+		fi
+
+		# store the name of the master branch
+		git_do config gitbpf.branch.master "$master_branch"
+	fi
+
+	# add a develop branch if no such branch exists yet
+	local develop_branch
+	if gitbpf_has_develop_configured && ! flag force; then
+		develop_branch=$(git config --get gitbpf.branch.develop)
+	else
+		# Again, the same two cases as with the master selection are
+		# considered (fresh repo or repo that contains branches)
+		local default_suggestion
+		local should_check_existence
+		branch_count=$(git_local_branches | grep -v "^${master_branch}\$" | wc -l)
+		if [ "$branch_count" -eq 0 ]; then
+			should_check_existence=NO
+			default_suggestion=$(git config --get gitbpf.branch.develop || echo develop)
+		else
+			echo
+			echo "Which branch should be used for integration of the \"next release\"?"
+			git_local_branches | grep -v "^${master_branch}\$" | sed 's/^.*$/   - &/g'
+
+			should_check_existence=YES
+			default_suggestion=
+			for guess in $(git config --get gitbpf.branch.develop) \
+			             'int' 'integration' 'develop (default)'; do
+			    suggestion=$(echo $guess | sed 's/ .*//')
+				if git_local_branch_exists "$suggestion" && [ "$suggestion" != "$master_branch" ]; then
+					default_suggestion="$suggestion"
+					break
+				fi
+			done
+			
+			if [ -z $default_suggestion ]; then
+				should_check_existence=NO
+				default_suggestion=$(git config --get gitbpf.branch.develop || echo develop)
+			fi
+			
+		fi
+
+		printf "Branch name for \"next release\" integration: [$default_suggestion] "
+		if noflag defaults; then
+			read answer
+		else
+			printf "\n"
+		fi
+		develop_branch=${answer:-$default_suggestion}
+
+		if [ "$master_branch" = "$develop_branch" ]; then
+			die "Production and integration branches should differ."
+		fi
+
+		# check existence in case of an already existing repo
+		if [ "$should_check_existence" = "YES" ]; then
+			git_local_branch_exists "$develop_branch" || \
+				die "Local branch '$develop_branch' does not exist."
+		fi
+
+		# store the name of the develop branch
+		git_do config gitbpf.branch.develop "$develop_branch"
+	fi
+
+	# add a QA branch if no such branch exists yet
+	local qa_branch
+	if gitbpf_has_qa_configured && ! flag force; then
+		qa_branch=$(git config --get gitbpf.branch.qa)
+	else
+		# Again, the same two cases as with the master selection are
+		# considered (fresh repo or repo that contains branches)
+		local default_suggestion
+		local should_check_existence
+		branch_count=$(git_local_branches | grep -v "^${master_branch}\$" | grep -v "^${develop_branch}\$"  | wc -l)
+		if [ "$branch_count" -eq 0 ]; then
+			should_check_existence=NO
+			default_suggestion=$(git config --get gitbpf.branch.qa || echo qa)
+		else
+			echo
+			echo "Which branch should be used for QA of the \"next release\"?"
+			git_local_branches | grep -v "^${master_branch}\$" | grep -v "^${develop_branch}\$" | sed 's/^.*$/   - &/g'
+
+			should_check_existence=YES
+			default_suggestion=
+			for guess in $(git config --get gitbpf.branch.qa) \
+			             'QA'; do
+			    suggestion=$(echo $guess | sed 's/ .*//')
+				if git_local_branch_exists "$suggestion" && [ "$suggestion" != "$master_branch" ] && [ "$suggestion" != "$develop_branch" ]; then
+					default_suggestion="$suggestion"
+					break
+				fi
+			done
+			
+			if [ -z $default_suggestion ]; then
+				should_check_existence=NO
+				default_suggestion=$(git config --get gitbpf.branch.qa || echo qa)
+			fi
+			
+		fi
+
+		printf "Branch name for \"next release\" QA: [$default_suggestion] "
+		if noflag defaults; then
+			read answer
+		else
+			printf "\n"
+		fi
+		qa_branch=${answer:-$default_suggestion}
+
+		if [ "$master_branch" = "$qa_branch" ]; then
+			die "Production and QA branches should differ."
+		fi
+
+		if [ "$develop_branch" = "$qa_branch" ]; then
+			die "Integration and QA branches should differ."
+		fi
+
+		# check existence in case of an already existing repo
+		if [ "$should_check_existence" = "YES" ]; then
+			git_local_branch_exists "$qa_branch" || \
+				die "Local branch '$qa_branch' does not exist."
+		fi
+
+		# store the name of the QA branch
+		git_do config gitbpf.branch.qa "$qa_branch"
+	fi
+
+	# add an orphan branch used for sharing git rerere (if no such branch exists yet)
+	local rerere_branch="rr-cache"
+
+	# if gitbpf_has_rerere_configured && ! flag force; then
+	# 	rerere_branch=$(git config --get gitbpf.branch.rerere)
+	# else
+	# 	# Again, the same two cases as with the master selection are
+	# 	# considered (fresh repo or repo that contains branches)
+	# 	local default_suggestion
+	# 	local should_check_existence
+	# 	branch_count=$(git_local_branches | grep -v "^${master_branch}\$" | grep -v "^${develop_branch}\$" | grep -v "^${qa_branch}\$" | wc -l)
+	#	if [ "$branch_count" -eq 0 ]; then
+	#		should_check_existence=NO
+	#		default_suggestion="rr-cache"
+	#	else
+	#		echo
+	#		echo "Which branch should be used for rerere sharing?"
+	#		git_local_branches | grep -v "^${master_branch}\$" | grep -v "^${develop_branch}\$" | grep -v "^${qa_branch}\$" | sed 's/^.*$/   - &/g'
+	#
+	#		should_check_existence=YES
+	#		default_suggestion=
+	#		for guess in $(git config --get gitbpf.branch.rerere) \
+	#		             'rr-cache'; do
+	#			if git_local_branch_exists "$guess" && [ "$guess" != "$master_branch" ] && [ "$guess" != "$develop_branch" ] && [ "$guess" != "$qa_branch" ]; then
+	#				default_suggestion="$guess"
+	#				break
+	#			fi
+	#		done
+	#		
+	#		if [ -z $default_suggestion ]; then
+	#			should_check_existence=NO
+	#			default_suggestion=$(git config --get gitbpf.branch.rerere || echo rr-cache)
+	#		fi
+	#	fi
+	#
+	#	printf "Branch name for rerere sharing: [$default_suggestion] "
+	#	if noflag defaults; then
+	#		read answer
+	#	else
+	#		printf "\n"
+	#	fi
+	#	rerere_branch=${answer:-$default_suggestion}
+	#
+	#	if [ "$master_branch" = "$rerere_branch" ]; then
+	#		die "Rerere sharing and production branches should differ."
+	#	fi
+	#
+	#	if [ "$develop_branch" = "$rerere_branch" ]; then
+	#		die "Rerere sharing and Integration branches should differ."
+	#	fi
+	#	
+	#	if [ "$qa_branch" = "$rerere_branch" ]; then
+	#		die "Rerere sharing and QA branches should differ."
+	#	fi
+	#
+	#
+	#	# check existence in case of an already existing repo
+	#	if [ "$should_check_existence" = "YES" ]; then
+	#		git_local_branch_exists "$rerere_branch" || \
+	#			die "Local branch '$rerere_branch' does not exist."
+	#	fi
+	#
+	#	# store the name of the rerere sharing branch
+	#	git_do config gitbpf.branch.qa "$rerere_branch"
+	# fi
+
+	# Creation of HEAD
+	# ----------------
+	# We create a HEAD now, if it does not exist yet (in a fresh repo). We need
+	# it to be able to create new branches.
+	local created_gitbpf_branch=0
+	if ! git rev-parse --quiet --verify HEAD >/dev/null 2>&1; then
+		git_do symbolic-ref HEAD "refs/heads/$master_branch"
+		git_do commit --allow-empty --quiet -m "Initial commit"
+		created_gitbpf_branch=1
+	fi
+
+	# Creation of master
+	# ------------------
+	# At this point, there always is a master branch: either it existed already
+	# (and was picked interactively as the production branch) or it has just
+	# been created in a fresh repo
+
+	# Creation of develop
+	# -------------------
+	# The develop branch possibly does not exist yet.  This is the case when,
+	# in a git init'ed repo with one or more commits, master was picked as the
+	# default production branch and develop was "created".  We should create
+	# the develop branch now in that case (we base it on master, of course)
+	if ! git_local_branch_exists "$develop_branch"; then
+		if [ -z "$remote_url" ] && git_remote_branch_exists "origin/$develop_branch"; then
+			git_do branch "$develop_branch" "origin/$develop_branch" >/dev/null 2>&1
+		else
+			git_do branch --no-track "$develop_branch" "$master_branch"
+		fi
+		created_gitbpf_branch=1
+	fi
+
+	# Creation of QA
+	# --------------
+	# The QA branch possibly does not exist yet.  This is the case when,
+	# in a git init'ed repo with one or more commits, master was picked as the
+	# default production branch and QA was "created".  We should create
+	# the QA branch now in that case (we base it on master, of course)
+	if ! git_local_branch_exists "$qa_branch"; then
+		if [ -z "$remote_url" ] && git_remote_branch_exists "origin/$qa_branch"; then
+			git_do branch "$qa_branch" "origin/$qa_branch" >/dev/null 2>&1
+		else
+			git_do branch --no-track "$qa_branch" "$master_branch"
+		fi
+		created_gitbpf_branch=1
+	fi
+
+	# TODO: check how we create aliases to git bpf commands.
+
+	# Set up rerere sharing
+	# ---------------------
+	# The rr-cache branch will be used to automatically share conflicts resolutions.
+	git_do config gitbpf.branch.rerere "$rerere_branch"
+	git_do config gitbpf.rerere.enabled "true"
+	git_do config gitbpf.rerere.autoupdate "true"
+	git_do config gitbpf.rerere.autoupdate "true"
+	git_do config gitbpf.remotename "origin"
+	git_do config gitbpf.remoterecreate "*"
+	local project_dir=$(pwd)
+	local rerere_path=$(pwd)"/.git/$rerere_branch"
+	local remote_url==$(git config --get remote.origin.url)
+
+	if [ ! -d "$rerere_path" ]; then
+		if [ -z "$remote_url" ]; then
+			git_do clone "-o" "origin" $remote_url $rerere_path
+		else
+			#die "Unable to clone [$remote_url] to [$rerere_path]"
+			git_do init "$rerere_path"
+			#FIXME : penser à rajouter la config du remote lors du premier push
+		fi
+	elif [ ! d "$rerere_path/.git" ]; then
+		echo "Rerere cache directory already exists; Initializing repository in existing $rerere_branch directory."
+		git_do init "$rerere_path"
+		if [ -z "$remote_url" ]; then
+			git_do remote add "origin" "$remote_url"
+		fi
+	else
+		echo "Rerere cache directory already exists and is a repository."
+	fi
+
+	cd $rerere_path
+
+	if [ -z "$remote_url" ]; then
+		git_do fetch "origin"
+	fi
+
+	if [ -z "$remote_url" ] && git_remote_branch_exists "origin/$rerere_branch"; then
+		# Remote has branch 'rr-cache', make sure we are currently on it.
+		git_do checkout "$rerere_branch"
+	else
+		# Create orphan branch 'rr-cache' and push to remote.
+		git_do checkout --orphan "$rerere_branch"
+		git_do rm -rf --ignore-unmatch "$rerere_path/"
+		git_do commit -a --allow-empty -m "Automatically creating branch to track conflict resolutions."
+		if [ -z "$remote_url" ]; then
+			git_do push "origin" "$rerere_branch"
+		fi
+	fi
+
+	# go back to master
+	cd $project_dir
+	git_do checkout "$master_branch"
+
+
+    #
+    # Symlink git-hooks.
+    #
+	local hooks_dir=$(pwd)"/.git/hooks"
+
+	echo "Adding git hooks..."
+
+	for hook in 'pre-commit' 'post-commit' 'post-checkout' 'pre-push'; do
+
+		target_hook_path="$hooks_dir/$hook"
+		source_hook_path=$(which git-bpf-${hook})
+
+		if [ ! -z "$source_hook_path" ]; then
+			if [ -e "$hooks_dir/$hook" ]; then
+				printf "Existing hook '$hook' detected, overwrite? [Yn]"
+				read answer
+
+				if [ "$answer" = "Y" ]; then
+					ln -s $source_hook_path $target_hook_path
+				fi
+			else
+				ln -s $source_hook_path $target_hook_path
+			fi
+		else
+			echo "unable to find hook $hook in classpath"
+		fi
+	done
+
+
+	# assert the gitbpf repo has been correctly initialized
+	gitbpf_is_initialized
+
+	# switch to develop branch if its newly created
+	#if [ $created_gitbpf_branch -eq 1 ]; then
+	#	git_do checkout -q "$develop_branch"
+	#fi
+
+	# finally, ask the user for naming conventions (branch and tag prefixes)
+	if flag force || \
+	   ! git config --get gitbpf.prefix.feature >/dev/null 2>&1 || 
+	   ! git config --get gitbpf.prefix.hotfix >/dev/null 2>&1 || 
+	   ! git config --get gitbpf.prefix.versiontag >/dev/null 2>&1; then
+	   	# TODO : voir si le versiontag est utile...
+		echo
+		echo "How to name your supporting branch prefixes?"
+	fi
+
+	local prefix
+
+	# Feature branches
+	if ! git config --get gitbpf.prefix.feature >/dev/null 2>&1 || flag force; then
+		default_suggestion=$(git config --get gitbpf.prefix.feature || echo feat-)
+		printf "Feature branches? [$default_suggestion] "
+		if noflag defaults; then
+			read answer
+		else
+			printf "\n"
+		fi
+		[ "$answer" = "-" ] && prefix= || prefix=${answer:-$default_suggestion}
+		git_do config gitbpf.prefix.feature "$prefix"
+	fi
+
+	# Hotfix branches
+	if ! git config --get gitbpf.prefix.hotfix >/dev/null 2>&1 || flag force; then
+		default_suggestion=$(git config --get gitbpf.prefix.hotfix || echo hotfix-)
+		printf "Hotfix branches? [$default_suggestion] "
+		if noflag defaults; then
+			read answer
+		else
+			printf "\n"
+		fi
+		[ "$answer" = "-" ] && prefix= || prefix=${answer:-$default_suggestion}
+		git_do config gitbpf.prefix.hotfix "$prefix"
+	fi
+
+	# Version tag prefix
+	if ! git config --get gitbpf.prefix.versiontag >/dev/null 2>&1 || flag force; then
+		default_suggestion=$(git config --get gitbpf.prefix.versiontag || echo "v-")
+		printf "Version tag prefix? [$default_suggestion] "
+		if noflag defaults; then
+			read answer
+		else
+			printf "\n"
+		fi
+		[ "$answer" = "-" ] && prefix= || prefix=${answer:-$default_suggestion}
+		git_do config gitbpf.prefix.versiontag "$prefix"
+	fi
+
+
+	# TODO: what to do with origin?
+}
+
+cmd_help() {
+	usage
+	exit 0
+}

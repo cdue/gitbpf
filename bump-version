@@ -1,0 +1,18 @@
+#!/bin/sh
+usage() {
+	echo "usage: bump-version <version-id>"
+}
+
+if [ $# -ne 1 ]; then
+	usage
+	exit 1
+fi
+
+if ! sed 's/^GITBPF_VERSION=.*$/GITBPF_VERSION='$1'/g' git-bpf-version > .git-bpf-version.new; then
+	echo "Could not replace GITBPF_VERSION variable." >&2
+	exit 2
+fi
+
+mv .git-bpf-version.new git-bpf-version
+git add git-bpf-version
+git commit -m "Bumped version number to $1" git-bpf-version

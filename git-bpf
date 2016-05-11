@@ -1,0 +1,119 @@
+#!/bin/sh
+#
+# git-bpf -- A collection of Git extensions to provide high-level
+# repository operations for Git Branch Per Feature (BPF) workflow.
+#
+# This project is an implementation of the Git BPF workflow
+# described by Adam Dymitruk:
+# 	http://dymitruk.com/blog/2012/02/05/branch-per-feature/
+# And its source code is wildly inspired by gitflow tools source code:
+#    https://github.com/nvie/gitflow
+# 
+# Feel free to contribute to this project at:
+#    https://github.com/cdue/gitbpf
+#
+# Copyright (c) 2015 Cédric Dué
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE
+#
+
+# set this to workaround expr problems in shFlags on freebsd
+if uname -s | egrep -iq 'bsd'; then export EXPR_COMPAT=1; fi
+
+# enable debug mode
+if [ "$DEBUG" = "yes" ]; then
+	set -x
+fi
+
+# The sed expression here replaces all backslashes by forward slashes.
+# This helps our Windows users, while not bothering our Unix users.
+export GITBPF_DIR=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")
+
+usage() {
+	echo "usage: git bpf <subcommand>"
+	echo
+	echo "Available subcommands are:"
+	echo "   init      Initialize a new git repo with support for the BPF branching model."
+	echo "   feature   Manage your feature branches."
+	echo "   release   Manage your release branches."
+	echo "   hotfix    Manage your hotfix branches."
+	echo "   version   Shows version information."
+	echo "   rerere    Manage rerere sharing (for conflicts auto-resolution)."
+	echo
+	echo "Try 'git bpf <subcommand> help' for details."
+}
+
+main() {
+	if [ $# -lt 1 ]; then
+		usage
+		exit 1
+	fi
+
+	# load common functionality
+	. "$GITBPF_DIR/gitbpf-common"
+
+	# This environmental variable fixes non-POSIX getopt style argument
+	# parsing, effectively breaking git-bpf subcommand parsing on several
+	# Linux platforms.
+	export POSIXLY_CORRECT=1
+
+	# use the shFlags project to parse the command line arguments
+	. "$GITBPF_DIR/gitbpf-shFlags"
+	FLAGS_PARENT="git bpf"
+
+	# allow user to request git action logging
+	DEFINE_boolean show_commands false 'show actions taken (git commands)' g
+
+	# do actual parsing
+	FLAGS "$@" || exit $?
+	eval set -- "${FLAGS_ARGV}"
+
+	# sanity checks
+	SUBCOMMAND="$1"; shift
+
+	if [ ! -e "$GITBPF_DIR/git-bpf-$SUBCOMMAND" ]; then
+		usage
+		exit 1
+	fi
+
+	# run command
+	. "$GITBPF_DIR/git-bpf-$SUBCOMMAND"
+	FLAGS_PARENT="git bpf $SUBCOMMAND"
+
+	# test if the first argument is a flag (i.e. starts with '-')
+	# in that case, we interpret this arg as a flag for the default
+	# command
+	SUBACTION="default"
+	if [ "$1" != "" ] && { ! echo "$1" | grep -q "^-"; } then
+		SUBACTION="$1"; shift
+	fi
+	if ! type "cmd_$SUBACTION" >/dev/null 2>&1; then
+		warn "Unknown subcommand: '$SUBACTION'"
+		usage
+		exit 1
+	fi
+
+	# run the specified action
+  if [ $SUBACTION != "help" ] && [ $SUBCOMMAND != "init" ] ; then
+    init
+  fi
+  cmd_$SUBACTION "$@"
+}
+
+main "$@"
